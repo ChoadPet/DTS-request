@@ -2,80 +2,94 @@ import Foundation
 import Network
 
 #warning("Custom warning: Dummy outgoing connection, waiting for permission API")
+// https://stackoverflow.com/q/63940427/6057764
 class LocalNetworkPermissionService {
     
-    private var host: String?
     private let port: UInt16
+    private var interfaces: [String] = []
+    private var connections: [NWConnection] = []
     
-    private var connection: NWConnection?
     
     init() {
         self.port = 12345
-        self.host = getWiFiAddress()
+        self.interfaces = ipv4AddressesOfEthernetLikeInterfaces()
     }
     
     deinit {
-        connection?.cancel()
+        connections.forEach { $0.cancel() }
     }
     
     // This method try to connect to iPhone self IP Address
     func triggerDialog() {
-        guard self.host != nil else { return assertionFailure("Hmm... no IP-Address?") }
-        let host = NWEndpoint.Host(self.host!)
-        let port = NWEndpoint.Port(integerLiteral: self.port)
-        connection = NWConnection(host: host, port: port, using: .udp)
-        connection?.stateUpdateHandler = { [weak self] state in
-            self?.stateUpdateHandler(state)
+        for interface in interfaces {
+            let host = NWEndpoint.Host(interface)
+            let port = NWEndpoint.Port(integerLiteral: self.port)
+            let connection = NWConnection(host: host, port: port, using: .udp)
+            connection.stateUpdateHandler = { [weak self, weak connection] state in
+                self?.stateUpdateHandler(state, connection: connection)
+            }
+            connection.start(queue: .main)
+            connections.append(connection)
         }
-        connection?.start(queue: .main)
     }
     
-    func stateUpdateHandler(_ state: NWConnection.State) {
-        print("state: \(state)")
+    // MARK: Private API
+    
+    private func stateUpdateHandler(_ state: NWConnection.State, connection: NWConnection?) {
         switch state {
-        case .waiting(let error):
-            debugPrint(error)
+        case .waiting:
             let content = "Hello Cruel World!".data(using: .utf8)
-            self.connection?.send(content: content, completion: .idempotent)
+            connection?.send(content: content, completion: .idempotent)
         default:
             break
         }
     }
     
-    // From: https://stackoverflow.com/a/30754194/6057764
-    // Return IP address of WiFi interface (en0) as a String, or `nil`
-    func getWiFiAddress() -> String? {
-        var address : String?
-
-        // Get list of all interfaces on the local machine:
-        var ifaddr : UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifaddr) == 0 else { return nil }
-        guard let firstAddr = ifaddr else { return nil }
-
-        // For each interface ...
-        for ifptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
-            let interface = ifptr.pointee
-
-            // Check for IPv4 or IPv6 interface:
-            let addrFamily = interface.ifa_addr.pointee.sa_family
-            if addrFamily == UInt8(AF_INET) || addrFamily == UInt8(AF_INET6) {
-
-                // Check interface name:
-                let name = String(cString: interface.ifa_name)
-                if  name == "en0" {
-
-                    // Convert interface address to a human readable string:
-                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                    getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
-                                &hostname, socklen_t(hostname.count),
-                                nil, socklen_t(0), NI_NUMERICHOST)
-                    address = String(cString: hostname)
+    private func namesOfEthernetLikeInterfaces() -> [String] {
+        var addrList: UnsafeMutablePointer<ifaddrs>? = nil
+        let err = getifaddrs(&addrList)
+        guard err == 0, let start = addrList else { return [] }
+        defer { freeifaddrs(start) }
+        return sequence(first: start, next: { $0.pointee.ifa_next })
+            .compactMap { i -> String? in
+                guard
+                    let sa = i.pointee.ifa_addr,
+                    sa.pointee.sa_family == AF_LINK,
+                    let data = i.pointee.ifa_data?.assumingMemoryBound(to: if_data.self),
+                    data.pointee.ifi_type == IFT_ETHER
+                else {
+                    return nil
                 }
+                return String(cString: i.pointee.ifa_name)
             }
-        }
-        freeifaddrs(ifaddr)
-
-        return address
     }
     
+    private func ipv4AddressesOfEthernetLikeInterfaces() -> [String] {
+        let interfaces = Set(namesOfEthernetLikeInterfaces())
+        
+        print("Interfaces: \(interfaces)")
+        var addrList: UnsafeMutablePointer<ifaddrs>? = nil
+        let err = getifaddrs(&addrList)
+        guard err == 0, let start = addrList else { return [] }
+        defer { freeifaddrs(start) }
+        return sequence(first: start, next: { $0.pointee.ifa_next })
+            .compactMap { i -> String? in
+                guard
+                    let sa = i.pointee.ifa_addr,
+                    sa.pointee.sa_family == AF_INET
+                else {
+                    return nil
+                }
+                let name = String(cString: i.pointee.ifa_name)
+                guard interfaces.contains(name) else { return nil }
+                var addr = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                let err = getnameinfo(sa, socklen_t(sa.pointee.sa_len), &addr, socklen_t(addr.count), nil, 0, NI_NUMERICHOST | NI_NUMERICSERV)
+                guard err == 0 else { return nil }
+                let address = String(cString: addr)
+                print("Address: \(address)")
+                return address
+            }
+    }
+    
+
 }
